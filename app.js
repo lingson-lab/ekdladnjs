@@ -41,3 +41,118 @@ $('download-billing').onclick=()=>{
 };
 months();render();
 if(document.modelContext?.registerTool){try{Promise.resolve(document.modelContext.registerTool({name:'get_household_summary',title:'세대별 집계 조회',description:'현재 화면의 수강시작월 및 필터에 맞는 시설별 세대 수와 회원 목록을 조회합니다.',inputSchema:{type:'object',properties:{},additionalProperties:false},annotations:{readOnlyHint:true,untrustedContentHint:true},execute(input){if(input&&Object.keys(input).length)throw Error('입력 항목이 필요하지 않습니다.');return {month:$('month').value,excludeTest:$('exclude').checked,groups:Object.fromEntries(keys.map(c=>[c,eligible(c).filter(h=>filters[c]==='all'||(filters[c]==='4'?h.count>=4:h.count===Number(filters[c]))).map(h=>({dong:h.dong,ho:h.ho,count:h.count,householdFeeWon:C.householdFee(c,h.count),kind:h.kind||'',members:h.members.map(m=>({name:m.name,role:m.role||''}))}))]))}}})).catch(()=>{})}catch{}}
+
+// 다인원 세대의 락커·신발장 요금 추가 — v5 전용
+(() => {
+  const core = HouseholdCore;
+  if (core.lockerChargesEnabled) return;
+
+  const originalGroups = core.billingGroups;
+  const normalize = value =>
+    String(value ?? "").normalize("NFKC").replace(/\s+/g, "");
+
+  const lockerNames = new Set([
+    "골프락커",
+    "헬스락커(남자)",
+    "헬스락커(여자)",
+    "헬스신발장(남자)",
+    "헬스신발장(여자)"
+  ]);
+
+  core.billingGroups = function (analysis) {
+    const groups = originalGroups(analysis);
+    const month = document.getElementById("month").value;
+
+    const households = new Map(
+      groups.map(g => [`${g.dong}|${g.ho}`, g])
+    );
+
+    const sales = rows.filter(
+      r => r.type === "매출" && !/취소/.test(r.status)
+    );
+
+    const charges = new Map();
+
+    for (const r of rows) {
+      const title = normalize(r.product);
+      const household = households.get(`${r.dong}|${r.ho}`);
+
+      if (!household || !lockerNames.has(title)) continue;
+      if (/취소/.test(r.status)) continue;
+      if (!["매출", "환불"].includes(r.type)) continue;
+
+      // 연결되는 원매출이 있으면 원매출의 수강시작월에 환불 반영
+      let periodRow = r;
+
+      if (r.type === "환불" && r.original) {
+        const matches = sales.filter(s =>
+          s.receipt === r.original &&
+          normalize(s.product) === title &&
+          s.dong === r.dong &&
+          s.ho === r.ho &&
+          (!r.member || s.member === r.member)
+        );
+
+        if (matches.length === 1) periodRow = matches[0];
+      }
+
+      if (
+        month &&
+        String(periodRow.start || "").slice(0, 7) !== month
+      ) continue;
+
+      const amount = Number(r.amount);
+      if (!Number.isFinite(amount)) continue;
+
+      const key = `${r.dong}|${r.ho}|${title}`;
+
+      if (!charges.has(key)) {
+        charges.set(key, {
+          household,
+          title,
+          amount: 0,
+          members: new Map(),
+          hasRefund: false
+        });
+      }
+
+      const charge = charges.get(key);
+
+      charge.amount += r.type === "환불"
+        ? -Math.abs(amount)
+        : amount;
+
+      charge.hasRefund ||= r.type === "환불";
+      charge.members.set(r.member || r.name, r.name);
+    }
+
+    for (const charge of charges.values()) {
+      // 전액 환불되어 금액이 0인 항목은 제외
+      if (charge.amount === 0 && charge.hasRefund) continue;
+
+      const g = charge.household;
+
+      g.rows.push({
+        category: "locker",
+        facility: charge.title,
+        dong: g.dong,
+        ho: g.ho,
+        members: [...charge.members.values()].filter(Boolean),
+        count: charge.members.size,
+        amount: charge.amount
+      });
+
+      g.knownTotal += charge.amount;
+    }
+
+    return groups.map(g => ({
+      ...g,
+      total: g.unknownCount ? null : g.knownTotal
+    }));
+  };
+
+  core.lockerChargesEnabled = true;
+
+  // 현재 화면에도 바로 반영
+  renderBilling();
+})();
